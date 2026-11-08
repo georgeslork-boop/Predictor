@@ -1,0 +1,6 @@
+streamlit
+scipy
+numpy
+pandas
+understat
+aiohttp
