@@ -1,21 +1,23 @@
-import asyncio
 from datetime import date
 
-import aiohttp
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 from scipy.stats import poisson
-from understat import Understat
 
 LEAGUES = {
     "Premier League": "EPL",
-    "La Liga": "La_liga",
+    "La Liga": "La_Liga",
     "Serie A": "Serie_A",
     "Bundesliga": "Bundesliga",
 }
 HOME_ADVANTAGE = 0.20
 MAX_GOALS = 10
+HEADERS = {
+    "X-Requested-With": "XMLHttpRequest",
+    "User-Agent": "Mozilla/5.0",
+}
 
 
 def current_season():
@@ -23,24 +25,26 @@ def current_season():
     return t.year if t.month >= 8 else t.year - 1
 
 
-async def _fetch(league, season):
-    async with aiohttp.ClientSession() as session:
-        return await Understat(session).get_league_results(league, season)
-
-
 @st.cache_data(ttl=3600, show_spinner="Φόρτωση δεδομένων από Understat...")
 def load_matches(league_code):
     season = current_season()
     rows = []
+    errors = []
     for s in (season, season - 1):
-        data = None
-        for name in (league_code, league_code.lower()):
-            try:
-                data = asyncio.run(_fetch(name, s))
-                break
-            except Exception:
+        try:
+            resp = requests.get(
+                f"https://understat.com/getLeagueData/{league_code}/{s}",
+                headers=HEADERS,
+                timeout=20,
+            )
+            resp.raise_for_status()
+            matches = resp.json().get("dates", [])
+        except Exception as e:
+            errors.append(f"{s}: {e}")
+            continue
+        for r in matches:
+            if not r.get("isResult"):
                 continue
-        for r in data or []:
             rows.append(
                 {
                     "date": r["datetime"],
@@ -54,7 +58,7 @@ def load_matches(league_code):
                 }
             )
     if not rows:
-        raise RuntimeError("Δεν επιστράφηκαν δεδομένα από την Understat.")
+        raise RuntimeError("Δεν επιστράφηκαν δεδομένα. " + " | ".join(errors))
     df = pd.DataFrame(rows)
     df["date"] = pd.to_datetime(df["date"])
     return df.sort_values("date")
