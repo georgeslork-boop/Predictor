@@ -1,3 +1,5 @@
+import json
+import re
 from datetime import date
 
 import numpy as np
@@ -8,21 +10,66 @@ from scipy.stats import poisson
 
 LEAGUES = {
     "Premier League": "EPL",
-    "La Liga": "La_Liga",
+    "La Liga": "La_liga",
     "Serie A": "Serie_A",
     "Bundesliga": "Bundesliga",
 }
 HOME_ADVANTAGE = 0.20
 MAX_GOALS = 10
-HEADERS = {
-    "X-Requested-With": "XMLHttpRequest",
-    "User-Agent": "Mozilla/5.0",
-}
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
 
 
 def current_season():
     t = date.today()
     return t.year if t.month >= 8 else t.year - 1
+
+
+def fetch_dates(league, season):
+    """Επιστρέφει τη λίστα αγώνων από την Understat (δύο μέθοδοι)."""
+    page = f"https://understat.com/league/{league}/{season}"
+    problems = []
+
+    # Μέθοδος 1: εσωτερικό JSON endpoint
+    try:
+        r = requests.get(
+            f"https://understat.com/getLeagueData/{league}/{season}",
+            headers={
+                "X-Requested-With": "XMLHttpRequest",
+                "User-Agent": UA,
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Accept-Encoding": "gzip, deflate",
+                "Referer": page,
+            },
+            timeout=20,
+        )
+        try:
+            return r.json()["dates"]
+        except Exception:
+            problems.append(
+                f"endpoint status={r.status_code} body={r.text[:100]!r}"
+            )
+    except Exception as e:
+        problems.append(f"endpoint error={e}")
+
+    # Μέθοδος 2: δεδομένα μέσα στη σελίδα HTML
+    try:
+        r = requests.get(
+            page,
+            headers={"User-Agent": UA, "Accept-Encoding": "gzip, deflate"},
+            timeout=20,
+        )
+        m = re.search(r"datesData\s*=\s*JSON\.parse\('(.*?)'\)", r.text)
+        if m:
+            raw = m.group(1).encode("ascii", "backslashreplace").decode("unicode_escape")
+            return json.loads(raw)
+        problems.append(f"html status={r.status_code} body={r.text[:100]!r}")
+    except Exception as e:
+        problems.append(f"html error={e}")
+
+    raise RuntimeError(" || ".join(problems))
 
 
 @st.cache_data(ttl=3600, show_spinner="Φόρτωση δεδομένων από Understat...")
@@ -32,15 +79,9 @@ def load_matches(league_code):
     errors = []
     for s in (season, season - 1):
         try:
-            resp = requests.get(
-                f"https://understat.com/getLeagueData/{league_code}/{s}",
-                headers=HEADERS,
-                timeout=20,
-            )
-            resp.raise_for_status()
-            matches = resp.json().get("dates", [])
+            matches = fetch_dates(league_code, s)
         except Exception as e:
-            errors.append(f"{s}: {e}")
+            errors.append(f"[{s}] {e}")
             continue
         for r in matches:
             if not r.get("isResult"):
