@@ -1,3 +1,4 @@
+import io
 import json
 import re
 from datetime import date
@@ -9,10 +10,10 @@ import streamlit as st
 from scipy.stats import poisson
 
 LEAGUES = {
-    "Premier League": "EPL",
-    "La Liga": "La_liga",
-    "Serie A": "Serie_A",
-    "Bundesliga": "Bundesliga",
+    "Premier League": ("EPL", "E0"),
+    "La Liga": ("La_liga", "SP1"),
+    "Serie A": ("Serie_A", "I1"),
+    "Bundesliga": ("Bundesliga", "D1"),
 }
 HOME_ADVANTAGE = 0.20
 MAX_GOALS = 10
@@ -27,12 +28,10 @@ def current_season():
     return t.year if t.month >= 8 else t.year - 1
 
 
-def fetch_dates(league, season):
-    """Επιστρέφει τη λίστα αγώνων από την Understat (δύο μέθοδοι)."""
+# ------------------------------------------------------------ Understat ----
+def fetch_understat(league, season):
     page = f"https://understat.com/league/{league}/{season}"
     problems = []
-
-    # Μέθοδος 1: εσωτερικό JSON endpoint
     try:
         r = requests.get(
             f"https://understat.com/getLeagueData/{league}/{season}",
@@ -40,7 +39,6 @@ def fetch_dates(league, season):
                 "X-Requested-With": "XMLHttpRequest",
                 "User-Agent": UA,
                 "Accept": "application/json, text/javascript, */*; q=0.01",
-                "Accept-Encoding": "gzip, deflate",
                 "Referer": page,
             },
             timeout=20,
@@ -48,63 +46,102 @@ def fetch_dates(league, season):
         try:
             return r.json()["dates"]
         except Exception:
-            problems.append(
-                f"endpoint status={r.status_code} body={r.text[:100]!r}"
-            )
+            problems.append(f"endpoint status={r.status_code}")
     except Exception as e:
         problems.append(f"endpoint error={e}")
-
-    # Μέθοδος 2: δεδομένα μέσα στη σελίδα HTML
     try:
-        r = requests.get(
-            page,
-            headers={"User-Agent": UA, "Accept-Encoding": "gzip, deflate"},
-            timeout=20,
-        )
+        r = requests.get(page, headers={"User-Agent": UA}, timeout=20)
         m = re.search(r"datesData\s*=\s*JSON\.parse\('(.*?)'\)", r.text)
         if m:
             raw = m.group(1).encode("ascii", "backslashreplace").decode("unicode_escape")
             return json.loads(raw)
-        problems.append(f"html status={r.status_code} body={r.text[:100]!r}")
+        problems.append(f"html status={r.status_code}, no data found")
     except Exception as e:
         problems.append(f"html error={e}")
+    raise RuntimeError(" / ".join(problems))
 
-    raise RuntimeError(" || ".join(problems))
 
-
-@st.cache_data(ttl=3600, show_spinner="Φόρτωση δεδομένων από Understat...")
-def load_matches(league_code):
-    season = current_season()
+def rows_from_understat(league, season, notes):
     rows = []
-    errors = []
-    for s in (season, season - 1):
-        try:
-            matches = fetch_dates(league_code, s)
-        except Exception as e:
-            errors.append(f"[{s}] {e}")
+    try:
+        matches = fetch_understat(league, season)
+    except Exception as e:
+        notes.append(f"Understat {season}: {e}")
+        return rows
+    for r in matches:
+        if not r.get("isResult"):
             continue
-        for r in matches:
-            if not r.get("isResult"):
-                continue
-            rows.append(
-                {
-                    "date": r["datetime"],
-                    "season": s,
-                    "home": r["h"]["title"],
-                    "away": r["a"]["title"],
-                    "hxg": float(r["xG"]["h"]),
-                    "axg": float(r["xG"]["a"]),
-                    "hg": int(r["goals"]["h"]),
-                    "ag": int(r["goals"]["a"]),
-                }
-            )
+        rows.append(
+            {
+                "date": r["datetime"],
+                "season": season,
+                "home": r["h"]["title"],
+                "away": r["a"]["title"],
+                "hxg": float(r["xG"]["h"]),
+                "axg": float(r["xG"]["a"]),
+                "hg": int(r["goals"]["h"]),
+                "ag": int(r["goals"]["a"]),
+            }
+        )
+    return rows
+
+
+# ------------------------------------------------------- football-data ----
+def shots_to_xg(shots, on_target):
+    """Χονδρική εκτίμηση xG από σουτ (δεν είναι πραγματικό xG)."""
+    return 0.22 * on_target + 0.04 * (shots - on_target)
+
+
+def rows_from_footballdata(code, season, notes):
+    rows = []
+    tag = f"{season % 100:02d}{(season + 1) % 100:02d}"
+    url = f"https://www.football-data.co.uk/mmz4281/{tag}/{code}.csv"
+    try:
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=20)
+        r.raise_for_status()
+        d = pd.read_csv(io.BytesIO(r.content), encoding="latin-1", on_bad_lines="skip")
+        need = ["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "HS", "AS", "HST", "AST"]
+        d = d.dropna(subset=need)
+    except Exception as e:
+        notes.append(f"football-data {season}: {e}")
+        return rows
+    for _, x in d.iterrows():
+        rows.append(
+            {
+                "date": pd.to_datetime(x["Date"], dayfirst=True, errors="coerce"),
+                "season": season,
+                "home": x["HomeTeam"],
+                "away": x["AwayTeam"],
+                "hxg": shots_to_xg(x["HS"], x["HST"]),
+                "axg": shots_to_xg(x["AS"], x["AST"]),
+                "hg": int(x["FTHG"]),
+                "ag": int(x["FTAG"]),
+            }
+        )
+    return rows
+
+
+@st.cache_data(ttl=3600, show_spinner="Φόρτωση δεδομένων...")
+def load_matches(understat_code, fd_code):
+    season = current_season()
+    notes = []
+    rows = []
+    for s in (season, season - 1):
+        rows += rows_from_understat(understat_code, s, notes)
+    source = "understat"
     if not rows:
-        raise RuntimeError("Δεν επιστράφηκαν δεδομένα. " + " | ".join(errors))
+        source = "footballdata"
+        for s in (season, season - 1):
+            rows += rows_from_footballdata(fd_code, s, notes)
+    if not rows:
+        raise RuntimeError("Καμία πηγή δεν απάντησε. " + " | ".join(notes))
     df = pd.DataFrame(rows)
     df["date"] = pd.to_datetime(df["date"])
-    return df.sort_values("date")
+    df = df.dropna(subset=["date"]).sort_values("date")
+    return df, source, notes
 
 
+# --------------------------------------------------------------- Μοντέλο ----
 def team_games(df, team, n, same_venue, is_home):
     d = df[df.home == team]
     h = pd.DataFrame(
@@ -112,8 +149,8 @@ def team_games(df, team, n, same_venue, is_home):
             "Ημερομηνία": d.date.dt.date,
             "Αντίπαλος": d.away,
             "Έδρα": "Εντός",
-            "xG υπέρ": d.hxg,
-            "xG κατά": d.axg,
+            "xG υπέρ": d.hxg.round(2),
+            "xG κατά": d.axg.round(2),
             "Γκολ": d.hg.astype(str) + "-" + d.ag.astype(str),
         }
     )
@@ -123,8 +160,8 @@ def team_games(df, team, n, same_venue, is_home):
             "Ημερομηνία": d.date.dt.date,
             "Αντίπαλος": d.home,
             "Έδρα": "Εκτός",
-            "xG υπέρ": d.axg,
-            "xG κατά": d.hxg,
+            "xG υπέρ": d.axg.round(2),
+            "xG κατά": d.hxg.round(2),
             "Γκολ": d.hg.astype(str) + "-" + d.ag.astype(str),
         }
     )
@@ -148,6 +185,7 @@ def predict(hg, ag):
     return home_xg, away_xg, p1 / t, px / t, p2 / t, m / t
 
 
+# ------------------------------------------------------------------- UI ----
 st.set_page_config(page_title="Πρόβλεψη Αγώνα", page_icon="⚽")
 st.title("⚽ Πρόβλεψη Αγώνα (xG & Poisson)")
 
@@ -158,12 +196,23 @@ with st.sidebar:
     )
 
 league_name = st.selectbox("Πρωτάθλημα", list(LEAGUES))
+u_code, fd_code = LEAGUES[league_name]
 
 try:
-    df = load_matches(LEAGUES[league_name])
+    df, source, notes = load_matches(u_code, fd_code)
 except Exception as e:
     st.error(f"Αποτυχία φόρτωσης δεδομένων: {e}")
     st.stop()
+
+if source == "footballdata":
+    st.warning(
+        "Η Understat δεν απάντησε. Τα xG είναι ΕΚΤΙΜΗΣΗ από τα σουτ "
+        "(football-data.co.uk), όχι πραγματικό xG."
+    )
+    with st.expander("Τεχνικές λεπτομέρειες"):
+        st.write(notes)
+else:
+    st.caption("Πηγή δεδομένων: Understat (πραγματικά xG)")
 
 cur = df[df.season == current_season()]
 src = cur if not cur.empty else df
