@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 
 import numpy as np
@@ -14,10 +15,11 @@ UA = (
 
 
 # ------------------------------------------------------------- Δεδομένα ----
-def fetch_chunk(start, end):
+def fetch_range(start, end):
+    dates = f"{start:%Y%m%d}" if start == end else f"{start:%Y%m%d}-{end:%Y%m%d}"
     r = requests.get(
         BASE_URL,
-        params={"dates": f"{start:%Y%m%d}-{end:%Y%m%d}", "limit": 1000},
+        params={"dates": dates, "limit": 200},
         headers={"User-Agent": UA},
         timeout=25,
     )
@@ -25,19 +27,44 @@ def fetch_chunk(start, end):
     return r.json().get("events", [])
 
 
-@st.cache_data(ttl=1800, show_spinner="Φόρτωση αγώνων NBA...")
+def fetch_chunk(span):
+    """Ζητά ένα διάστημα. Αν αποτύχει, δοκιμάζει ημέρα-ημέρα."""
+    start, end = span
+    try:
+        return fetch_range(start, end), None
+    except Exception as e:
+        err = str(e)
+    events, fails = [], 0
+    d = start
+    while d <= end:
+        try:
+            events += fetch_range(d, d)
+        except Exception:
+            fails += 1
+        d += timedelta(days=1)
+    return events, (f"{start}: {err}" if fails else None)
+
+
+@st.cache_data(ttl=1800, show_spinner="Φόρτωση αγώνων NBA (η πρώτη φορά κρατά λίγο)...")
 def load_games():
     today = date.today()
     season = today.year if today.month >= 10 else today.year - 1
     cur = date(season - 1, 10, 1)  # από την προηγούμενη σεζόν
-    rows, notes, seen = [], [], set()
+
+    spans = []
     while cur <= today:
-        end = min(cur + timedelta(days=30), today)
-        try:
-            events = fetch_chunk(cur, end)
-        except Exception as e:
-            notes.append(f"{cur}: {e}")
-            events = []
+        end = min(cur + timedelta(days=6), today)
+        if not (cur.month in (7, 8, 9) and end.month in (7, 8, 9)):
+            spans.append((cur, end))
+        cur = end + timedelta(days=1)
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(fetch_chunk, spans))
+
+    rows, notes, seen = [], [], set()
+    for events, note in results:
+        if note:
+            notes.append(note)
         for ev in events:
             try:
                 if ev["id"] in seen or not ev["status"]["type"]["completed"]:
@@ -68,7 +95,6 @@ def load_games():
                 )
             except Exception:
                 continue
-        cur = end + timedelta(days=1)
     if not rows:
         raise RuntimeError("Δεν επιστράφηκαν αγώνες. " + " | ".join(notes[:3]))
     df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
@@ -281,6 +307,9 @@ st.caption(
     f"Πηγή: ESPN. {len(df)} αγώνες (προηγούμενη και τρέχουσα σεζόν). "
     "Το μοντέλο ΔΕΝ γνωρίζει τραυματισμούς ή ποιοι παίκτες απουσιάζουν."
 )
+if notes:
+    with st.expander(f"Προειδοποίηση: {len(notes)} διαστήματα δεν φορτώθηκαν πλήρως"):
+        st.write(notes[:5])
 
 teams = sorted(set(df.home) | set(df.away))
 c1, c2 = st.columns(2)
