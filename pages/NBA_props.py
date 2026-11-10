@@ -1,3 +1,6 @@
+import difflib
+import re
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -20,6 +23,7 @@ COMBOS = {
     "RA": ["REB", "AST"],
 }
 NORMAL_STATS = {"PTS", "PRA", "PR", "PA", "RA"}
+NUM_COLS = ["Γραμμή", "Over απόδοση", "Under απόδοση", "Διόρθωση μέσου"]
 
 
 def get_json(url, params=None):
@@ -188,6 +192,83 @@ def status_label(s):
     return f"{EMOJI.get(s.lower(), '⚪')} {s}" if s else "Υγιής"
 
 
+# ---------------------------------------------------------- Εισαγωγή ----
+def _norm(s):
+    s = unicodedata.normalize("NFKD", str(s))
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9 ]", "", s.lower()).strip()
+
+
+def to_decimal(x):
+    """Δεκαδική απόδοση. Δέχεται και αμερικάνικες (π.χ. -110, +150)."""
+    try:
+        v = float(str(x).replace(",", ".").replace("+", "").strip())
+    except Exception:
+        return np.nan
+    if v >= 100:
+        return 1 + v / 100
+    if v <= -100:
+        return 1 + 100 / abs(v)
+    return v if v > 1 else np.nan
+
+
+def parse_import(text, labels):
+    norm_map = {_norm(lb): lb for lb in labels}
+    rows, problems = [], []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in re.split(r"[;\t|]", line)]
+        if len(parts) < 3:
+            problems.append(f"Δεν κατάλαβα τη γραμμή: {line}")
+            continue
+        name, stat = parts[0], parts[1].upper()
+        if stat not in STATS:
+            problems.append(f"Άγνωστο στατιστικό «{parts[1]}» στη γραμμή: {line}")
+            continue
+        try:
+            ln = float(parts[2].replace(",", "."))
+        except Exception:
+            problems.append(f"Μη έγκυρη γραμμή στο: {line}")
+            continue
+        key = _norm(name)
+        label = norm_map.get(key)
+        if label is None:
+            close = difflib.get_close_matches(key, list(norm_map), n=1, cutoff=0.75)
+            label = norm_map[close[0]] if close else None
+        if label is None:
+            problems.append(f"Ο παίκτης «{name}» δεν βρέθηκε στις δύο ομάδες.")
+        rows.append(
+            {
+                "Παίκτης": label,
+                "Στατιστικό": stat,
+                "Γραμμή": ln,
+                "Over απόδοση": to_decimal(parts[3]) if len(parts) > 3 else np.nan,
+                "Under απόδοση": to_decimal(parts[4]) if len(parts) > 4 else np.nan,
+                "Διόρθωση μέσου": 0.0,
+            }
+        )
+    df = pd.DataFrame(rows)
+    for c in NUM_COLS:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df, problems
+
+
+def empty_template():
+    return pd.DataFrame(
+        {
+            "Παίκτης": [None],
+            "Στατιστικό": ["PTS"],
+            "Γραμμή": [np.nan],
+            "Over απόδοση": [np.nan],
+            "Under απόδοση": [np.nan],
+            "Διόρθωση μέσου": [0.0],
+        }
+    )
+
+
 # ------------------------------------------------------------------- UI ----
 st.set_page_config(page_title="NBA Props", page_icon="🏀")
 st.title("🏀 NBA: Τραυματισμοί, νέα & player props")
@@ -305,8 +386,8 @@ for t in (t1, t2):
 st.divider()
 st.subheader("Player props & value")
 st.caption(
-    "Γράψε τη γραμμή και την απόδοση που βλέπεις στο site σου. "
-    "PRA = πόντοι+ριμπάουντ+ασίστ, PR = πόντοι+ριμπάουντ, PA = πόντοι+ασίστ, "
+    "Γράψε τη γραμμή και την απόδοση που βλέπεις στο site σου, ή κάνε εισαγωγή από κείμενο "
+    "παρακάτω. PRA = πόντοι+ριμπάουντ+ασίστ, PR = πόντοι+ριμπάουντ, PA = πόντοι+ασίστ, "
     "RA = ριμπάουντ+ασίστ, 3PM = τρίποντα που βάζει. "
     "Η «Διόρθωση μέσου» προστίθεται στον αναμενόμενο αριθμό (π.χ. +3 πόντοι αν λείπει ο βασικός συμπαίκτης)."
 )
@@ -319,21 +400,36 @@ except Exception as e:
 label_to_id = {p["name"]: p["id"] for p in roster}
 labels = sorted(label_to_id)
 
-template = pd.DataFrame(
-    [
-        {
-            "Παίκτης": None,
-            "Στατιστικό": "PTS",
-            "Γραμμή": None,
-            "Over απόδοση": None,
-            "Under απόδοση": None,
-            "Διόρθωση μέσου": 0.0,
-        }
-    ]
-)
+# Κατάσταση πίνακα (επιβιώνει των ανανεώσεων, μηδενίζεται όταν αλλάζουν ομάδες)
+pair = f"{t1}|{t2}"
+if st.session_state.get("props_pair") != pair:
+    st.session_state["props_pair"] = pair
+    st.session_state["props_df"] = empty_template()
+    st.session_state["props_ver"] = st.session_state.get("props_ver", 0) + 1
+
+with st.expander("Εισαγωγή από κείμενο (π.χ. από φωτογραφία μέσω Claude)"):
+    st.caption(
+        "Μία γραμμή ανά επιλογή, με ερωτηματικά: Παίκτης; Στατιστικό; Γραμμή; Over; Under. "
+        "Παράδειγμα: Jayson Tatum; PTS; 27.5; 1.87; 1.93. "
+        "Δέχεται και αμερικάνικες αποδόσεις (π.χ. -110)."
+    )
+    txt = st.text_area("Επικόλλησε εδώ", height=160, key="import_text")
+    if st.button("Εισαγωγή στον πίνακα"):
+        new_df, problems = parse_import(txt, labels)
+        if new_df.empty:
+            st.error("Δεν διαβάστηκε καμία γραμμή.")
+        else:
+            st.session_state["props_df"] = new_df
+            st.session_state["props_ver"] += 1
+            st.success(f"Εισήχθησαν {len(new_df)} γραμμές.")
+        if problems:
+            st.warning("Έλεγξε τα παρακάτω:")
+            for p in problems:
+                st.write("- " + p)
+
 edited = st.data_editor(
-    template,
-    key=f"props_{t1}_{t2}",
+    st.session_state["props_df"],
+    key=f"props_{pair}_{st.session_state['props_ver']}",
     num_rows="dynamic",
     hide_index=True,
     use_container_width=True,
